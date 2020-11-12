@@ -1,0 +1,679 @@
+---
+title: "Variable selection procedure"
+author: "Stephanie Herman"
+date: "`r format(Sys.time())`"
+output: 
+  rmarkdown::html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: spacelab
+    highlight: textmate
+    df_print: paged
+    code_folding: hide
+    self_contained: false
+    keep_md: false
+    encoding: "UTF-8"
+    css: ["assets/lab.css"]
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, include = FALSE)
+library(here)
+library(glmnet)
+library(ggplot2)
+library(tidyr)
+library(pROC)
+library(reshape2)
+library(gridExtra)
+library(knitr)
+library(gtools)
+library(caret)
+library(dplyr)
+library(ggpubr)
+library(viridis)
+library(emmeans)
+library(RColorBrewer)
+```
+
+
+```{r, include=FALSE}
+# load functions
+source(file.path(here(), 'data_processing/Functions.R'))
+set.seed(435)
+
+# load matching
+load(file.path(here(), 'data/MS3data.RData'))
+load(file.path(here(), 'data/MS1data.RData'))
+
+# load matched features
+load('featureMatch.RData')
+```
+
+
+```{r}
+# save untouched data for later
+MS3data$untouched <- MS3data$data
+MS1data$untouched <- MS1data$data
+
+# format data for analysis
+MS3data$data <- data.frame(t(MS3data$data[, -c(1,2)]), stringsAsFactors = F)
+MS1data$data <- data.frame(t(MS1data$data[, -c(1,2)]), stringsAsFactors = F)
+```
+
+```{r}
+cutoff <- .9
+
+# coverage cutoff MS3
+ind <- which(apply(MS3data$data, 2, function(x) sum(!is.na(x))/length(x))>=cutoff)
+MS3data$data <- MS3data$data[, ind]
+
+# coverage cutoff MS1
+ind <- which(apply(MS1data$data, 2, function(x) sum(!is.na(x))/length(x))>=cutoff)
+MS1data$data <- MS1data$data[, ind]
+```
+
+```{r, include = T}
+# extract age dependent metabos
+ind <- which(MS3data$metadata$Condition == 'ctrl')
+
+pVal <- c()
+for (i in 1:ncol(MS3data$data)) {
+  c <- cor.test(as.numeric(MS3data$data[ind,i]), MS3data$metadata$Age[ind], na.action = "na.omit")
+  pVal <- c(pVal, c$p.value)
+}
+n <- which(pVal<0.05)
+age.rm <- names(MS3data$data)[n]
+MS3data$data <- MS3data$data[, -n]
+
+#cat('Number of removed age dependent metabolites: ', length(age.rm))
+```
+
+# Linking the cohorts
+
+The features were matched between cohorts using a **±2.5 ppm** and **±5 sec**. Additionally, an average intensity deviation less than **±5 standard deviation** was allowed and only metabolic features present in 90% of the samples in both cohorts were kept. Finally, metabolic features that show a statistically significant (p-value<0.05) age dependence in the healthy control subjects in cohort 1 were excluded. 
+
+Remaining missing values were replaced by the average feature value and features were centered separately within both cohorts.
+
+```{r, include = T, echo = T}
+# rename MS1 metabolites
+row.names(featureMatch) <- featureMatch$MS1
+names(MS1data$data) <- paste0('X', featureMatch[gsub('X', '', names(MS1data$data)), 'MS3'])
+
+common <- intersect(names(MS1data$data), names(MS3data$data))
+MS1data$data <- MS1data$data[, common]
+MS3data$data <- MS3data$data[, common]
+
+# intensity diff cutoff
+int.MS3 <- apply(MS3data$data[which(MS3data$metadata$Collection == 1), ], 2, function(x) mean(x, na.rm=T))
+int.MS1 <- apply(MS1data$data, 2, function(x) mean(x, na.rm=T))
+
+intDiff <- apply(cbind(int.MS3, int.MS1), 1, function(x) x[1]-x[2])
+ind <- which(abs(intDiff)<sd(intDiff))
+
+MS1data$data <- MS1data$data[, ind]
+MS3data$data <- MS3data$data[, ind]
+
+cat('Number of final metabolic features: ', length(ind))
+
+# impute by average
+colmissing <- which(apply(is.na(MS3data$data), 2, any))
+for (i in 1:length(colmissing)) {
+  temp <- MS3data$data[,colmissing[i]]
+  temp[is.na(temp)] <- mean(temp, na.rm=T)
+  MS3data$data[,colmissing[i]] <- temp
+}
+
+colmissing <- which(apply(is.na(MS1data$data), 2, any))
+for (i in 1:length(colmissing)) {
+  temp <- MS1data$data[,colmissing[i]]
+  temp[is.na(temp)] <- mean(temp, na.rm=T)
+  MS1data$data[,colmissing[i]] <- temp
+}
+
+# center features within cohort
+MS3data$data <- scale(MS3data$data, center = T, scale = F)
+MS1data$data <- scale(MS1data$data, center = T, scale = F)
+
+# extract RRMS and PMS patients, first samplings, MS3 cohort
+MS3meta <- MS3data$metadata[MS3data$metadata$Collection==1,]
+MS3meta <- MS3meta[which(MS3meta$Condition=='PMS' | MS3meta$Condition=='RRMS'),]
+MS3train <- data.frame(MS3data$data[MS3meta$Code,])
+MS3train <- cbind(MS3meta$Condition, MS3train)
+names(MS3train)[1] <- 'Condition'
+
+# extract RRMS and PMS patients, MS1 cohort
+MS1meta <- MS1data$metadata[which(MS1data$metadata$Condition=='PMS' | MS1data$metadata$Condition=='RRMS'), ]
+MS1train <- data.frame(MS1data$data[row.names(MS1meta),])
+MS1train <- cbind(MS1meta$Condition, MS1train)
+names(MS1train)[1] <- 'Condition'
+```
+
+# Train GLMNET model
+
+Variable selection was done solely on the training (MS3) cohort. The training cohort consisted of **35 RRMS** and **35 PMS** patients. A regularized regression with an alpha = 0.5 (elastic-net regularization) was trained with a lambda of 1 standard error from the lambda that minimized the cross validated deviance in a balanced 7-fold cross validation.
+
+```{r, include = T, echo = T}
+# scale training data
+X <- scale(MS3train[, -1], center = T, scale = T)
+train_scaling <- list()
+train_scaling$center <- attr(X, "scaled:center")
+train_scaling$scale <- attr(X, "scaled:scale")
+Y <- as.character(MS3train$Condition)
+X <- data.frame(X)
+train <- cbind(Y, X)
+train <- train[sort(as.character(train$Y), decreasing = T, index.return = T)$ix, ]
+
+alpha.fit <- .5
+foldid <- c(rep(sample.int(7),5), rep(sample.int(7),5))
+
+# optimize lambda
+elm_fit <- cv.glmnet(as.matrix(train[, -1]), 
+                     factor(train$Y, levels = c('RRMS', 'PMS')), 
+                     family="binomial", 
+                     alpha=alpha.fit, 
+                     standardize = F, 
+                     foldid = foldid)
+
+# train model with optimized lambda
+model <- glmnet(as.matrix(train[, -1]), 
+                factor(train$Y, levels = c('RRMS', 'PMS')), 
+                family="binomial", 
+                lambda = elm_fit$lambda.1se, 
+                alpha = alpha.fit, 
+                standardize = F)
+```
+
+```{r, include = T, fig.height = 6, fig.width = 5, fig.align = 'center'}
+# extract model coefficients
+coefs <- model$beta[, 1]
+coefs <- data.frame(Coefficient = coefs[-which(coefs == 0)])
+coefs$Metabo <- row.names(coefs)
+cat('Number of selected metabolic features: ', nrow(coefs))
+
+coefs <- coefs[sort(abs(coefs$Coefficient), decreasing = T, index.return = T)$ix, ]
+coefs$Metabo <- factor(coefs$Metabo, levels = coefs$Metabo)
+
+cplot <- ggplot(coefs, aes(x = Metabo, y = Coefficient)) + 
+  geom_bar(stat = 'identity', width = .6, col = 'white', fill = 'darkred') + coord_flip() + 
+  theme(legend.position = 'none') + ylab('') + xlab('') + theme_pubr() + geom_hline(yintercept = 0)
+cplot
+```
+**Figure 1.** The selected metabolic features ranked according to their coefficients, $\beta$, from the regularized regression.
+
+# Predict the test cohort
+
+To evaluate the performance of the regularized model, cohort 2 (MS1) was used as an independent test set.
+
+```{r, include = T, echo = T, fig.height = 5, fig.width = 5, fig.align = 'center'}
+# scale MS1 cohort
+MS1_X <- data.frame(scale(MS1train[, -1], center = train_scaling$center, scale = train_scaling$scale))
+MS1_Y <- factor(MS1train$Condition, levels = c('RRMS', 'PMS'))
+
+# predict response for test cohort
+prediction <- predict(model, as.matrix(MS1_X), type = "response")
+myroc <- roc(MS1_Y, prediction[, 1],
+             ci=TRUE, stratified=FALSE,
+             plot=FALSE, 
+             print.auc=TRUE, show.thres=TRUE)
+```
+
+```{r, echo = F, warning = F}
+# compute and compare AUC for model vs the selected features in isolation
+theroc  <- setNames(data.frame(cbind(1 - rev(myroc$specificities),
+                                     rev(myroc$sensitivities))), c('x', 'y'))
+
+metauc <- c()
+plotx <- list()
+ploty <- list()
+n <- 1
+for (i in 1:ncol(MS1_X[, as.character(coefs$Metabo)])) {
+  metroc <- roc(MS1_Y, MS1_X[, as.character(coefs$Metabo)[i]],
+                # arguments for ci
+                ci=TRUE, stratified=FALSE,
+                # arguments for plot
+                print.auc=TRUE, show.thres=TRUE)
+  
+  metauc <- c(metauc, metroc$auc)
+  
+  plotx[[n]] <- 1 - rev(metroc$specificities)
+  ploty[[n]] <- rev(metroc$sensitivities)
+  n <- n + 1
+}
+
+x <- melt(plotx)
+y <- melt(ploty)
+names(x) <- c("x", "remove")
+names(y) <- c("y", "Metabolite")
+plotroc <- cbind(x,y)
+plotroc <- plotroc[,-2]
+
+interval = 0.2
+breaks = seq(0, 1, interval)
+```
+
+```{r, include = T, fig.height = 5, fig.width = 5, fig.align = 'center'}
+plotroc$Metabolite <- factor(plotroc$Metabolite)
+mypal <- plasma(length(coefs$Metabo)+1)
+roc_plot <- ggplot(plotroc, aes(x = x, y = y, col = Metabolite)) + geom_line(alpha = .4) +
+  scale_color_manual(values = mypal) +
+  geom_segment(aes(x = 0, y = 0, xend = 1,yend = 1), alpha = 0.9, linetype=2, col = 'gray30') +
+  scale_x_continuous(name = "1-Specificity",limits = c(0,1), breaks = breaks, expand = c(0.001,0.001)) +
+  scale_y_continuous(name = "Sensitivity", limits = c(0,1), breaks = breaks, expand = c(0.001, 0.001)) +
+  theme_bw() +
+  theme(axis.ticks = element_line(color = "grey80"), legend.position = "none", text = element_text(size=12)) +
+  coord_equal() +
+  geom_line(data = theroc, aes(x = x, y = y), col = 'black', size = 1) +
+  annotate("text", x = 0.65, y = 0.10, vjust = 0, 
+           label = paste0("AUC = ", round(myroc$auc, digits = 2),
+                          ' (', round(myroc$ci[1], digits = 2), ' - ', 
+                          round(myroc$ci[3], digits = 2), ')'), size = 5) +
+  annotate("text", x = 0.65, y = 0.05, vjust = 0, 
+           label = paste0("AUC = (", round(range(metauc)[1], digits = 2), ' - ',
+                          round(range(metauc)[2], digits = 2), ')'), size = 5) 
+roc_plot
+```
+
+```{r, include = T, fig.height = 5, fig.width = 5, fig.align = 'center'}
+# predict class labels for test cohort
+prediction <- predict(model, as.matrix(MS1_X), type = "class")
+confusionMatrix(factor(prediction, levels = c('RRMS', 'PMS')), MS1_Y, positive = 'PMS')
+```
+
+```{r, include = T, warning = F, fig.align = 'center'}
+# plot confusion matrix
+cm <- confusionMatrix(factor(prediction, levels = c('RRMS', 'PMS')), MS1_Y, positive = 'PMS')
+fourfoldplot(cm$table)
+```
+
+# Predict transitioners
+
+```{r, include = T}
+# extract and scale transitioners
+trans <- rbind(MS3data$data[which(MS3data$metadata$Condition == 'Transition'), ],
+               MS1data$data[which(MS1data$metadata$Condition == 'Transition'), ])
+trans <- data.frame(scale(trans, center = train_scaling$center, scale = train_scaling$scale))
+
+# predict phenotypes of transitioners
+prob <- predict(model, as.matrix(trans), type = "response")
+class <- predict(model, as.matrix(trans), type = "class")
+
+print(cbind(prob, class[, 1]))
+```
+
+# PCA on both cohorts
+
+To visualize the selected features in the two cohorts, a principal component analysis (PCA) was done on each cohort and the selected features.
+
+```{r}
+# PCA on MS3
+pca <- prcomp(train[, as.character(coefs$Metabo)], center = F, scale. = F)
+
+vars<- pca$sdev^2
+vars<- vars/sum(vars)
+
+plotdata <- data.frame(cbind(pca$x[,1:2], 
+                             row.names(train),
+                             as.character(train$Y)), 
+                       stringsAsFactors = F)
+names(plotdata)[3] <- 'Sample.ID'
+names(plotdata)[4] <- "Condition"
+
+plotdata$PC1 <- as.numeric(as.character(plotdata$PC1))
+plotdata$PC2 <- as.numeric(as.character(plotdata$PC2))
+
+plotdata$Condition <- factor(plotdata$Condition, levels = c('RRMS', 'PMS'))
+pca.MS3 <- ggplot(plotdata, aes(x=PC1, y=PC2, col = Condition, shape = Condition, label = Sample.ID)) + 
+  geom_point(size = 2) + 
+  xlab(paste0('PC1: explaining ',round(vars[1], digits = 3)*100, '% of the variance')) + 
+  ylab(paste0('PC2: explaining ',round(vars[2], digits = 3)*100, '% of the variance')) + theme_bw()  +
+  scale_shape_manual(values = c(19, 17)) +
+  scale_color_manual(values = c('#3C568E', '#CC3333', '#CC3333')) +
+  ggtitle('Training (MS3) cohort')
+
+# coded according to age and sex
+plotdata.meta <- cbind(plotdata, MS3data$metadata[plotdata$Sample.ID, c('Gender', 'Age')])
+
+pca.MS3.sex <- ggplot(plotdata.meta, aes(x=PC1, y=PC2, col = Gender, shape = Condition, label = Sample.ID)) + 
+  geom_point(size = 2) + 
+  xlab(paste0('PC1 (',round(vars[1], digits = 3)*100, '%)')) + 
+  ylab(paste0('PC2 (',round(vars[2], digits = 3)*100, '%)')) + theme_bw()  +
+  scale_shape_manual(values = c(19, 17)) +
+  ggtitle('MS3 sexes')
+
+pca.MS3.age <- ggplot(plotdata.meta, aes(x=PC1, y=PC2, col = Age, shape = Condition, label = Sample.ID)) + 
+  geom_point(size = 2) + 
+  xlab(paste0('PC1 (',round(vars[1], digits = 3)*100, '%)')) + 
+  ylab(paste0('PC2 (',round(vars[2], digits = 3)*100, '%)')) + theme_bw()  +
+  scale_shape_manual(values = c(19, 17)) +
+  ggtitle('MS3 ages') +
+  scale_color_viridis(option = 'D', direction = -1) 
+
+# scale all MS3 data
+MS3subset <- data.frame(cbind(MS3data$metadata$Condition), 
+                        MS3data$data,
+                        stringsAsFactors = F)
+names(MS3subset)[1] <- 'Condition'
+MS3subset[, -1] <- data.frame(scale(MS3subset[, -1], center = train_scaling$center, scale = train_scaling$scale))
+
+# project the controls
+MS3ctrl <- MS3subset[MS3subset$Condition == 'ctrl', c('Condition', as.character(coefs$Metabo))]
+MS3ctrl <- data.frame(as.matrix(MS3ctrl[, -1]) %*% pca$rotation )
+MS3ctrl <- cbind(MS3ctrl[,1:2], row.names(MS3ctrl))
+names(MS3ctrl)[3] <- 'Sample.ID'
+MS3ctrl$Condition <- 'Control'
+
+plotdata.ctrl <- rbind(plotdata, MS3ctrl)
+pca.MS3.ctrl <- ggplot(plotdata.ctrl, aes(x=PC1, y=PC2, col = Condition, shape = Condition, label = Sample.ID, alpha = Condition)) + 
+  geom_point(size = 2) + 
+  xlab(paste0('PC1: explaining ',round(vars[1], digits = 3)*100, '% of the variance')) + 
+  ylab(paste0('PC2: explaining ',round(vars[2], digits = 3)*100, '% of the variance')) + theme_bw()  +
+  scale_shape_manual(values = c(15, 19, 17)) +
+  scale_color_manual(values = c('black', '#3C568E', '#CC3333')) +
+  scale_alpha_manual(values = c(1, .5, .5)) +
+  ggtitle('Projected controls')
+
+# project transitioners
+MS3trans <- MS3subset[MS3subset$Condition == 'Transition', c('Condition', as.character(coefs$Metabo))]
+MS3trans <- data.frame(as.matrix(MS3trans[, -1]) %*% pca$rotation )
+MS3trans <- cbind(MS3trans[,1:2], row.names(MS3trans))
+names(MS3trans)[3] <- 'Sample.ID'
+MS3trans$Condition <- 'Transition'
+
+plotdata.trans <- rbind(plotdata, MS3trans)
+pca.MS3.trans <- ggplot(plotdata.trans, aes(x=PC1, y=PC2, col = Condition, shape = Condition, label = Sample.ID, alpha = Condition)) + 
+  geom_point(size = 2) + 
+  xlab(paste0('PC1: explaining ',round(vars[1], digits = 3)*100, '% of the variance')) + 
+  ylab(paste0('PC2: explaining ',round(vars[2], digits = 3)*100, '% of the variance')) + theme_bw()  +
+  scale_shape_manual(values = c(19, 17, 8)) +
+  scale_color_manual(values = c('#3C568E', '#CC3333', 'black')) +
+  scale_alpha_manual(values = c(.5, .5, 1)) +
+  ggtitle('Projected transitioners')
+
+# project the follow-up samples from the clinical trial
+MS3clin <- MS3subset[grep('T', row.names(MS3subset)), c('Condition', as.character(coefs$Metabo))]
+MS3clin <- data.frame(as.matrix(MS3clin[-grep('T1', row.names(MS3clin)), -1]) %*% pca$rotation )
+MS3clin <- cbind(MS3clin[,1:2], row.names(MS3clin))
+names(MS3clin)[3] <- 'Sample.ID'
+MS3clin$Condition <- substrRight(as.character(MS3clin$Sample.ID), 2)
+
+plotdata.time <- rbind(plotdata.ctrl, MS3clin)
+plotdata.time$Condition <- factor(plotdata.time$Condition, levels = rev(c('PMS', paste0('T', 2:4), 'RRMS', 'Control')))
+bplot <- ggplot(plotdata.time, aes(x=Condition, y=PC1, fill = Condition, label = Sample.ID)) + 
+  geom_boxplot(width=0.5, outlier.color = 'white', outlier.size = 0) +
+  geom_jitter(width = 0.1, alpha=I(0.5)) + theme_pubr() +
+  scale_fill_manual(values = rev(c('#CC3333', '#F36F56', '#F8A88D', '#FDDFD1', '#3C568E', 'white'))) + 
+  theme(legend.position = 'none', text = element_text(size=12),
+        axis.text = element_text(size = 9.5)) + xlab('') + 
+  ylab(paste0('PC1: explaining ',round(vars[1], digits = 3)*100, '% of the variance')) + coord_flip()
+
+# PCA on MS1
+pca <- prcomp(MS1_X[, as.character(coefs$Metabo)], center = F, scale. = F)
+
+vars<- pca$sdev^2
+vars<- vars/sum(vars)
+
+plotdata <- data.frame(cbind(pca$x[,1:2], 
+                             row.names(MS1_X),
+                             as.character(MS1_Y)), 
+                       stringsAsFactors = F)
+names(plotdata)[3] <- 'Sample.ID'
+names(plotdata)[4] <- "Condition"
+
+plotdata$PC1 <- as.numeric(as.character(plotdata$PC1))
+plotdata$PC2 <- as.numeric(as.character(plotdata$PC2))
+
+plotdata$Condition <- factor(plotdata$Condition, levels = c('RRMS', 'PMS'))
+pca.MS1 <- ggplot(plotdata, aes(x=PC1, y=PC2, col = Condition, shape = Condition, label = Sample.ID)) + 
+  geom_point(size = 2) + 
+  xlab(paste0('PC1: explaining ',round(vars[1], digits = 3)*100, '% of the variance')) + 
+  ylab(paste0('PC2: explaining ',round(vars[2], digits = 3)*100, '% of the variance')) + theme_bw()  +
+  scale_shape_manual(values = c(19, 17)) +
+  scale_color_manual(values = c('#3C568E', '#CC3333', '#CC3333')) +
+  ggtitle('Test (MS1) cohort')
+
+# coded according to age and sex
+plotdata.meta <- cbind(plotdata, MS1data$metadata[plotdata$Sample.ID, c('Gender', 'Age')])
+
+pca.MS1.sex <- ggplot(plotdata.meta, aes(x=PC1, y=PC2, col = Gender, shape = Condition, label = Sample.ID)) + 
+  geom_point(size = 2) + 
+  xlab(paste0('PC1 (',round(vars[1], digits = 3)*100, '%)')) + 
+  ylab(paste0('PC2 (',round(vars[2], digits = 3)*100, '%)')) + theme_bw()  +
+  scale_shape_manual(values = c(19, 17)) +
+  ggtitle('MS1 sexes')
+
+pca.MS1.age <- ggplot(plotdata.meta, aes(x=PC1, y=PC2, col = Age, shape = Condition, label = Sample.ID)) + 
+  geom_point(size = 2) + 
+  xlab(paste0('PC1 (',round(vars[1], digits = 3)*100, '%)')) + 
+  ylab(paste0('PC2 (',round(vars[2], digits = 3)*100, '%)')) + theme_bw()  +
+  scale_shape_manual(values = c(19, 17)) +
+  ggtitle('MS1 ages') +
+  scale_color_viridis(option = 'D', direction = -1) 
+
+# scale all MS1 data
+MS1subset <- data.frame(cbind(MS1data$metadata$Condition), 
+                        MS1data$data,
+                        stringsAsFactors = F)
+names(MS1subset)[1] <- 'Condition'
+MS1subset[, -1] <- data.frame(scale(MS1subset[, -1], center = train_scaling$center, scale = train_scaling$scale))
+
+# project the controls
+MS1ctrl <- MS1subset[MS1subset$Condition == 'ctrl', c('Condition', as.character(coefs$Metabo))]
+MS1ctrl <- data.frame(as.matrix(MS1ctrl[, -1]) %*% pca$rotation )
+MS1ctrl <- cbind(MS1ctrl[,1:2], row.names(MS1ctrl))
+names(MS1ctrl)[3] <- 'Sample.ID'
+MS1ctrl$Condition <- 'Control'
+
+plotdata.ctrl <- rbind(plotdata, MS1ctrl)
+pca.MS1.ctrl <- ggplot(plotdata.ctrl, aes(x=PC1, y=PC2, col = Condition, shape = Condition, label = Sample.ID, alpha = Condition)) + 
+  geom_point(size = 2) + 
+  xlab(paste0('PC1: explaining ',round(vars[1], digits = 3)*100, '% of the variance')) + 
+  ylab(paste0('PC2: explaining ',round(vars[2], digits = 3)*100, '% of the variance')) + theme_bw()  +
+  scale_shape_manual(values = c(15, 19, 17)) +
+  scale_color_manual(values = c('black', '#3C568E', '#CC3333')) +
+  scale_alpha_manual(values = c(1, .5, .5)) +
+  ggtitle('Projected controls')
+
+# project the transitions
+MS1trans <- MS1subset[MS1subset$Condition == 'Transition', c('Condition', as.character(coefs$Metabo))]
+MS1trans <- data.frame(as.matrix(MS1trans[, -1]) %*% pca$rotation )
+MS1trans <- cbind(MS1trans[,1:2], row.names(MS1trans))
+names(MS1trans)[3] <- 'Sample.ID'
+MS1trans$Condition <- 'Transition'
+
+plotdata.trans <- rbind(plotdata, MS1trans)
+pca.MS1.trans <- ggplot(plotdata.trans, aes(x=PC1, y=PC2, col = Condition, shape = Condition, label = Sample.ID, alpha = Condition)) + 
+  geom_point(size = 2) + 
+  xlab(paste0('PC1: explaining ',round(vars[1], digits = 3)*100, '% of the variance')) + 
+  ylab(paste0('PC2: explaining ',round(vars[2], digits = 3)*100, '% of the variance')) + theme_bw()  +
+  scale_shape_manual(values = c(19, 17, 8)) +
+  scale_color_manual(values = c('#3C568E', '#CC3333', 'black')) +
+  scale_alpha_manual(values = c(.5, .5, 1)) +
+  ggtitle('Projected transitioners')
+```
+
+```{r, include = T, fig.align = 'center', fig.width = 12, fig.height = 15}
+adds <- theme(legend.position = 'none', 
+              plot.title = element_text(size = 18, face = "bold"),
+              axis.text = element_text(size = 12),
+              axis.title = element_text(size = 12),
+              plot.margin = unit(c(.5,.5,.5,.5), "cm"))
+grid.arrange(pca.MS3 + adds, 
+             pca.MS1 + adds, 
+             pca.MS3.trans + adds,
+             pca.MS1.trans + adds,
+             pca.MS3.ctrl + adds,
+             pca.MS1.ctrl + adds, ncol = 2)
+```
+**Figure 3.** Principal component analyses of the 31 selected metabolic features on the training (MS3) cohort and the test (MS1) cohort. The PMS patients have been visualized as *red triangles* and the RRMS patients as *blue points*.
+
+```{r, include = T, fig.align = 'center', fig.width = 12, fig.height = 10}
+grid.arrange(pca.MS3.age + adds, 
+             pca.MS1.age + adds, 
+             pca.MS3.sex + adds, 
+             pca.MS1.sex + adds, ncol = 2)
+```
+
+# Clinical trial
+
+```{r, include = T, fig.align = 'center', fig.width = 7, fig.height = 5}
+bplot
+```
+**Figure 4.** Projected PC1 scores of the follow-up samples from the clinical trial of rituximab. Note, this plot does only include samples from the MS3 cohort.
+
+\
+**Mann-Whitney tests** between the time points in the clinical trial.
+
+```{r}
+plotdata.time$Time <- substrRight(plotdata.time$Sample.ID, 2)
+plotdata.time$Time[-grep('T', plotdata.time$Time)] <- ''
+plotdata.time$Subject <- substr(plotdata.time$Sample.ID, 1,4)
+plotdata.time$Subject <- gsub('T', '', plotdata.time$Subject) 
+```
+
+```{r, include = T, echo = T}
+indiv <- intersect(plotdata.time[plotdata.time$Time == 'T1', 'Subject'],
+                   plotdata.time[plotdata.time$Time == 'T2', 'Subject'])
+wilcox.test(plotdata.time[paste0(indiv, 'T1'), 'PC1'], 
+            plotdata.time[paste0(indiv, 'T2'), 'PC1'], paired = T)
+```
+
+```{r, include = T, echo = T}
+indiv <- intersect(plotdata.time[plotdata.time$Time == 'T1', 'Subject'],
+                   plotdata.time[plotdata.time$Time == 'T3', 'Subject'])
+wilcox.test(plotdata.time[paste0(indiv, 'T1'), 'PC1'], 
+            plotdata.time[paste0(indiv, 'T3'), 'PC1'], paired = T)
+```
+
+```{r, include = T, echo = T}
+indiv <- intersect(plotdata.time[plotdata.time$Time == 'T1', 'Subject'],
+                   plotdata.time[plotdata.time$Time == 'T4', 'Subject'])
+wilcox.test(plotdata.time[paste0(indiv, 'T1'), 'PC1'], 
+            plotdata.time[paste0(indiv, 'T4'), 'PC1'], paired = T)
+```
+
+# Summarize selection
+
+```{r}
+selected <- as.character(coefs[sort(abs(coefs$Coefficient), 
+                                    decreasing = T, index.return = T)$ix, 'Metabo'])
+row.names(featureMatch) <- paste0('X', featureMatch$MS3)
+selected <- featureMatch[selected, ]
+
+selected$mz <- round(MS3data$untouched[selected$MS3, 'mz_cf'], digits = 2)
+selected$rt <- round(MS3data$untouched[selected$MS3, 'rt_cf'], digits = 2)
+
+# extract untouched data for MS3 training set
+MS3dat <- data.frame(cbind(MS3meta[, c('Condition', 'Age', 'Gender')], 
+                           data.frame(t(MS3data$untouched[selected$MS3, row.names(MS3meta)]))), stringsAsFactors = F)
+
+# fit models
+selected$FC.MS3 <- NA
+selected$pVal.MS3 <- NA
+selected$sex.MS3 <- NA
+for (i in 4:ncol(MS3dat)) {
+  input <- MS3dat[, c(1:3, i)]
+  names(input)[4] <- 'Metabo'
+  
+  input$Condition <- factor(input$Condition, levels = c('PMS', 'RRMS'))
+  lm_model <- lm(Metabo ~ Condition + Gender, data = input)
+  em <- emmeans(lm_model, 'Condition')
+  ctr <- data.frame(emmeans::contrast(em, "pairwise"))
+  
+  selected$FC.MS3[i-3] <- round(ctr$estimate, digits = 2)
+  selected$pVal.MS3[i-3] <- ctr$p.value
+  
+  em <- emmeans(lm_model, 'Gender')
+  ctr <- data.frame(emmeans::contrast(em, "pairwise"))
+  
+  selected$sex.MS3[i-3] <- ctr$p.value
+}
+selected$pVal.MS3 <- stars.pval(selected$pVal.MS3)
+selected$sex.MS3 <- stars.pval(selected$sex.MS3)
+
+# extract untouched data for MS1 testing set
+MS1dat <- data.frame(cbind(MS1meta[, c('Condition', 'Age', 'Gender')],  
+                           data.frame(t(MS1data$untouched[selected$MS1, row.names(MS1meta)]))), stringsAsFactors = F)
+names(MS1dat)[1] <- 'Condition'
+
+# fit models
+selected$FC.MS1 <- NA
+selected$pVal.MS1 <- NA
+selected$sex.MS1 <- NA
+for (i in 4:ncol(MS1dat)) {
+  input <- MS1dat[, c(1:3, i)]
+  names(input)[4] <- 'Metabo'
+  
+  input$Condition <- factor(input$Condition, levels = c('PMS', 'RRMS'))
+  lm_model <- lm(Metabo ~ Condition + Gender, data = input)
+  em <- emmeans(lm_model, 'Condition')
+  ctr <- data.frame(emmeans::contrast(em, "pairwise"))
+  
+  selected$FC.MS1[i-3] <- round(ctr$estimate, digits = 2)
+  selected$pVal.MS1[i-3] <- ctr$p.value
+  
+  em <- emmeans(lm_model, 'Gender')
+  ctr <- data.frame(emmeans::contrast(em, "pairwise"))
+  
+  selected$sex.MS1[i-3] <- ctr$p.value
+}
+selected$pVal.MS1 <- stars.pval(selected$pVal.MS1)
+selected$sex.MS1 <- stars.pval(selected$sex.MS1)
+
+write.table(selected, file = 'table_of_selection.csv', sep = ';')
+```
+
+```{r, include = T}
+# find inconsistent features
+selected$inconsistent <- as.numeric(sign(selected$FC.MS3) != sign(selected$FC.MS1))
+selected$inconsistent[selected$inconsistent == 0] <- ''
+
+# create table
+kable(selected, caption = 'Summarized data for the selected metabolic features using emmeans.', 
+      row.names = F, align = rep('c', ncol(selected))) 
+```
+
+# Boxplots
+
+```{r, include = T, fig.align = 'center', fig.width = 13, fig.height = 12}
+# extract untouched MS3 data
+MS3dat <- data.frame(cbind(as.character(MS3data$metadata$Condition), 
+                           as.character(MS3data$metadata$Collection),
+                           data.frame(t(MS3data$untouched[selected$MS3, -c(1,2)]))), stringsAsFactors = F)
+names(MS3dat)[1:2] <- c('Condition', 'Collection')
+
+# center
+MS3dat[, paste0('X', selected$MS3)] <- scale(MS3dat[, paste0('X', selected$MS3)], center = T, scale = F)
+
+MS3dat <- MS3dat[MS3dat$Collection == 1, ]
+MS3dat$Cohort <- 'MS3'
+
+# extract untouched MS1 data
+MS1dat <- data.frame(cbind(as.character(MS1data$metadata$Condition), 
+                           data.frame(t(MS1data$untouched[selected$MS1, -c(1,2)]))), stringsAsFactors = F)
+names(MS1dat) <- c('Condition', paste0('X', selected$MS3))
+MS1dat$Cohort <- 'MS1'
+
+# center 
+MS1dat[, paste0('X', selected$MS3)] <- scale(MS1dat[, paste0('X', selected$MS3)], center = T, scale = F)
+
+comb <- rbind(MS3dat[, c('Cohort', 'Condition', paste0('X', selected$MS3))],
+              MS1dat[, c('Cohort', 'Condition', paste0('X', selected$MS3))])
+
+
+comb <- gather(comb, 'Metabolite', 'Value', -c(Condition, Cohort))
+comb$Group <- paste(comb$Cohort, comb$Condition)
+comb <- comb[-which(comb$Condition == 'Transition'), ]
+comb <- comb[-which(is.na(comb$Value)),]
+
+comb$Metabolite <- factor(comb$Metabolite, levels = paste0('X', selected$MS3))
+ggplot(comb, aes(Group, Value, fill = Group)) + 
+  geom_boxplot() + scale_fill_manual(values = c(brewer.pal(3, 'Reds'), brewer.pal(3, 'Blues'))) +
+  facet_wrap(~Metabolite, scales = 'free') + 
+  ylab('log2 intensity') + xlab('') + theme_bw() + 
+  theme(axis.text.x = element_blank(), 
+        axis.title = element_text(size = 12), 
+        axis.text = element_text(size = 12))
+```

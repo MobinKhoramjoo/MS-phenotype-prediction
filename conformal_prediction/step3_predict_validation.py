@@ -65,7 +65,7 @@ results_trans = pd.DataFrame(data={
     'p['+label1+']':pvals_transitioners[:,1]})
 
 # Save the predictions
-results_trans.to_csv("results/transitioners_predictions.csv", sep=',')
+results_trans.to_csv("results/transitioners_predictions.csv", sep=',',index=False)
 
 # P0 vs P1 plot
 markers = [common_utils.marker_dict[label0], common_utils.marker_dict[label1], common_utils.marker_dict['Transitioner']]
@@ -77,7 +77,7 @@ p1p0_fig = plotting.plot_pvalues(np.hstack((y_valid, np.full(len(pvals_transitio
 p1p0_fig.savefig('results/p0p1_plot.pdf')
 
 # Calibration plot
-calib_fig = plotting.plot_calibration_curve(y_valid, pvals, labels=[label0, label1], sign_step=0.005, cm=common_utils.cm_rrms_pms)
+calib_fig = plotting.plot_calibration_curve(y_valid, pvals, labels=[label0, label1], sign_vals=np.arange(0,1,0.005), cm=common_utils.cm_rrms_pms)
 calib_fig.savefig('results/calibration_plot_discovery_vs_validation.pdf')
 
 # Efficiency plot

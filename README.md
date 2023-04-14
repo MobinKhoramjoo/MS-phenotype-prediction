@@ -3,7 +3,7 @@
 The code in this repository was used to generate the results presented in the article *Disease phenotype prediction in multiple sclerosis*.
 
 ## Background
-Progressive multiple sclerosis (PMS) is currently diagnosed retrospectively. We investigated an alternative approach to evaluate the transition to PMS.
+Progressive multiple sclerosis (PMS) is currently diagnosed retrospectively. We investigated an alternative approach to evaluate the transition to PMS, using metabolomics and conformal prediction.
 
 ## Components
 The analysis workflow consists of three main components:

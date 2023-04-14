@@ -1,4 +1,5 @@
 # MS-phenotype-prediction
+[![DOI](https://zenodo.org/badge/308637679.svg)](https://zenodo.org/badge/latestdoi/308637679)
 
 The code in this repository was used to generate the results presented in the article *Disease phenotype prediction in multiple sclerosis*.
 
